@@ -1,0 +1,446 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:vibration/vibration.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:uuid/uuid.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  tz.initializeTimeZones();
+  runApp(const MyApp());
+}
+
+final FlutterLocalNotificationsPlugin notifications = FlutterLocalNotificationsPlugin();
+final FlutterTts tts = FlutterTts();
+final uuid = Uuid();
+
+class Task {
+  String id;
+  String title;
+  DateTime dateTime;
+  String whyImportant;
+  String whyNow;
+  bool isCompleted;
+
+  Task({
+    required this.id,
+    required this.title,
+    required this.dateTime,
+    required this.whyImportant,
+    required this.whyNow,
+    this.isCompleted = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'dateTime': dateTime.toIso8601String(),
+        'whyImportant': whyImportant,
+        'whyNow': whyNow,
+        'isCompleted': isCompleted,
+      };
+
+  factory Task.fromJson(Map<String, dynamic> json) => Task(
+        id: json['id'],
+        title: json['title'],
+        dateTime: DateTime.parse(json['dateTime']),
+        whyImportant: json['whyImportant'],
+        whyNow: json['whyNow'],
+        isCompleted: json['isCompleted'] ?? false,
+      );
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Мотиватор Задач',
+      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+      home: const CalendarScreen(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class CalendarScreen extends StatefulWidget {
+  const CalendarScreen({super.key});
+
+  @override
+  State<CalendarScreen> createState() => _CalendarScreenState();
+}
+
+class _CalendarScreenState extends State<CalendarScreen> {
+  List<Task> tasks = [];
+  DateTime selectedDate = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _initNotifications();
+  }
+
+  Future<void> _initNotifications() async {
+    const AndroidInitializationSettings android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const InitializationSettings settings = InitializationSettings(android: android);
+    await notifications.initialize(settings);
+
+    // Разрешения для Android 13+
+    await notifications
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+  }
+
+  Future<void> _scheduleNotification(Task task) async {
+    await notifications.zonedSchedule(
+      task.id.hashCode,
+      'Время действовать!',
+      task.title,
+      tz.TZDateTime.from(task.dateTime, tz.local),
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'task_channel',
+          'Задачи',
+          channelDescription: 'Напоминания о задачах',
+          importance: Importance.max,
+          priority: Priority.high,
+          fullScreenIntent: true,
+          enableVibration: true,
+        ),
+      ),
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+      payload: task.id,
+    );
+  }
+
+  void _showTaskDialog(Task task) async {
+    if (await Vibration.hasVibrator() ?? false) {
+      Vibration.vibrate(pattern: [500, 1000, 500, 1000]);
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => TaskExecutionDialog(task: task, onDone: () {
+        setState(() => task.isCompleted = true);
+        Navigator.pop(ctx);
+      }, onRemindLater: () {
+        Navigator.pop(ctx);
+        _showWhyNowDialog(task);
+      }),
+    );
+  }
+
+  void _showWhyNowDialog(Task task) async {
+    await tts.setLanguage("ru-RU");
+    await tts.speak("Почему это нужно сделать прямо сейчас: ${task.whyNow}");
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => WhyNowDialog(
+        task: task,
+        onPerformNow: () {
+          Navigator.pop(ctx);
+          _showTaskDialog(task);
+        },
+        onPostpone: () {
+          final newTime = DateTime.now().add(const Duration(minutes: 15));
+          task.dateTime = newTime;
+          _scheduleNotification(task);
+          Navigator.pop(ctx);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Напоминание через 15 минут")),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final todayTasks = tasks.where((t) => isSameDay(t.dateTime, selectedDate)).toList()
+      ..sort((a, b) => a.dateTime.compareTo(b.dateTime));
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Календарь задач")),
+      body: Column(
+        children: [
+          CalendarDatePicker(
+            initialDate: selectedDate,
+            firstDate: DateTime(2020),
+            lastDate: DateTime(2030),
+            onDateChanged: (date) => setState(() => selectedDate = date),
+          ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: todayTasks.length,
+              itemBuilder: (ctx, i) {
+                final task = todayTasks[i];
+                return Card(
+                  child: ListTile(
+                    leading: task.isCompleted
+                        ? const Icon(Icons.check_circle, color: Colors.green)
+                        : const Icon(Icons.circle_outlined),
+                    title: Text(task.title),
+                    subtitle: Text("${task.dateTime.hour}:${task.dateTime.minute.toString().padLeft(2, '0')}"),
+                    trailing: task.whyNow.isNotEmpty
+                        ? const Icon(Icons.smart_toy, color: Colors.purple)
+                        : null,
+                    onTap: () => _showTaskDialog(task),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        child: const Icon(Icons.add),
+        onPressed: () => _showAddTaskDialog(),
+      ),
+    );
+  }
+
+  void _showAddTaskDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AddTaskDialog(
+        onSave: (task) {
+          setState(() => tasks.add(task));
+          _scheduleNotification(task);
+        },
+      ),
+    );
+  }
+
+  bool isSameDay(DateTime a, DateTime b) {
+    return a.year == b.year && a.month == b.month && a.day == b.day;
+  }
+}
+
+// Диалог добавления задачи с AI
+class AddTaskDialog extends StatefulWidget {
+  final Function(Task) onSave;
+  const AddTaskDialog({super.key, required this.onSave});
+
+  @override
+  State<AddTaskDialog> createState() => _AddTaskDialogState();
+}
+
+class _AddTaskDialogState extends State<AddTaskDialog> {
+  final titleCtrl = TextEditingController();
+  final whyImportantCtrl = TextEditingController();
+  final whyNowCtrl = TextEditingController();
+  DateTime selectedDateTime = DateTime.now().add(const Duration(minutes: 5));
+
+  // Заглушка AI (можно подключить Grok API)
+  void _generateWithAI(String type) async {
+    final title = titleCtrl.text;
+    if (title.isEmpty) return;
+
+    String suggestion = "";
+    if (type == "important") {
+      suggestion = "Это важно, потому что $title напрямую влияет на твоё здоровье, отношения или будущее.";
+    } else {
+      suggestion = "Сделай это сейчас, потому что завтра будет сложнее / дороже / поздно. Окно возможностей закрывается!";
+    }
+
+    if (type == "important") {
+      whyImportantCtrl.text = suggestion;
+    } else {
+      whyNowCtrl.text = suggestion;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text("Новая задача"),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: "Название задачи")),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Text("Дата и время:"),
+                TextButton(
+                  onPressed: () async {
+                    final date = await showDatePicker(
+                      context: context,
+                      initialDate: selectedDateTime,
+                      firstDate: DateTime.now(),
+                      lastDate: DateTime(2030),
+                    );
+                    if (date != null) {
+                      final time = await showTimePicker(context: context, initialTime: TimeOfDay.now());
+                      if (time != null) {
+                        setState(() {
+                          selectedDateTime = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+                        });
+                      }
+                    }
+                  },
+                  child: Text("${selectedDateTime.day}.${selectedDateTime.month} ${selectedDateTime.hour}:${selectedDateTime.minute}"),
+                ),
+              ],
+            ),
+            TextField(
+              controller: whyImportantCtrl,
+              decoration: InputDecoration(
+                labelText: "Почему важно?",
+                suffixIcon: IconButton(icon: const Icon(Icons.smart_toy), onPressed: () => _generateWithAI("important")),
+              ),
+              maxLines: 2,
+            ),
+            TextField(
+              controller: whyNowCtrl,
+              decoration: InputDecoration(
+                labelText: "Почему делать СЕЙЧАС?",
+                suffixIcon: IconButton(icon: const Icon(Icons.smart_toy), onPressed: () => _generateWithAI("now")),
+              ),
+              maxLines: 2,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Отмена")),
+        ElevatedButton(
+          onPressed: () {
+            if (titleCtrl.text.isNotEmpty) {
+              final task = Task(
+                id: uuid.v4(),
+                title: titleCtrl.text,
+                dateTime: selectedDateTime,
+                whyImportant: whyImportantCtrl.text,
+                whyNow: whyNowCtrl.text.isEmpty ? "Сейчас — лучшее время!" : whyNowCtrl.text,
+              );
+              widget.onSave(task);
+              Navigator.pop(context);
+            }
+          },
+          child: const Text("Сохранить"),
+        ),
+      ],
+    );
+  }
+}
+
+// Полноэкранное выполнение задачи
+class TaskExecutionDialog extends StatelessWidget {
+  final Task task;
+  final VoidCallback onDone;
+  final VoidCallback onRemindLater;
+
+  const TaskExecutionDialog({super.key, required this.task, required this.onDone, required this.onRemindLater});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black.withOpacity(0.9),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.notifications_active, size: 100, color: Colors.white),
+            const SizedBox(height: 30),
+            Text(
+              "Время выполнить:",
+              style: const TextStyle(color: Colors.white, fontSize: 24),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              task.title,
+              style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 20),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40),
+              child: Text(
+                "Почему важно: ${task.whyImportant}",
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 18),
+              ),
+            ),
+            const SizedBox(height: 60),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green, padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 20)),
+                  onPressed: onDone,
+                  child: const Text("ОК", style: TextStyle(fontSize: 20)),
+                ),
+                const SizedBox(width: 30),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.orange, padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 20)),
+                  onPressed: onRemindLater,
+                  child: const Text("НАПОМНИТЬ ПОЗЖЕ", style: TextStyle(fontSize: 18)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Диалог "Почему сейчас"
+class WhyNowDialog extends StatelessWidget {
+  final Task task;
+  final VoidCallback onPerformNow;
+  final VoidCallback onPostpone;
+
+  const WhyNowDialog({super.key, required this.task, required this.onPerformNow, required this.onPostpone});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.deepPurple.shade900,
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(30),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.record_voice_over, size: 80, color: Colors.white),
+              const SizedBox(height: 30),
+              const Text(
+                "Почему это нужно сделать ПРЯМО СЕЙЧАС:",
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                task.whyNow,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white, fontSize: 28),
+              ),
+              const SizedBox(height: 60),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ElevatedButton(onPressed: onPostpone, child: const Text("Отложить")),
+                  const SizedBox(width: 20),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                    onPressed: onPerformNow,
+                    child: const Text("Выполнить сейчас!"),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
